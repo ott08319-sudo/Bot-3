@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: bot-3-wd5p
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn -w 1 -k gthread --threads 8 -b 0.0.0.0:$PORT app:app
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: BYTECOIN_API_KEY
+        sync: false
+      - key: BYTECOIN_WEBHOOK_SECRET
+        sync: false
+      - key: BYTECOIN_ENABLED
+        value: "false"
+      - key: ADMIN_TOKEN
+        sync: false
+      - key: SELF_URL
+        value: https://bot-3-wd5p.onrender.com
