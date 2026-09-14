@@ -294,12 +294,14 @@ def webhook():
     h = {k.lower(): v for k, v in request.headers.items()}
     try:
         event = verify_webhook(h, raw)
-    except Exception:
+    except Exception as e:
+        print(f"[webhook] verify failed: {e}", flush=True)
         return jsonify({"code": "INVALID_WEBHOOK_SIGNATURE"}), 401
+    print(f"[webhook] received event_type={event.get('event')} id={event.get('id')}", flush=True)
     try:
         save_event_and_job(event)
     except Exception as e:
-        print(f"[webhook] storage: {e}")
+        print(f"[webhook] storage: {e}", flush=True)
         return jsonify({"code": "WEBHOOK_STORAGE_UNAVAILABLE"}), 503
     return "", 204
 
@@ -319,24 +321,41 @@ def process_jobs():
                         cur.execute("""UPDATE webhook_jobs SET status='done',
                                        processed_at=now() WHERE id=%s""", (j["id"],))
                     except Exception as e:
+                        print(f"[worker] job {j['id']} failed: {e}", flush=True)
                         cur.execute("""UPDATE webhook_jobs
                                        SET retry_count=retry_count+1, last_error=%s,
                                        status=CASE WHEN retry_count>=10 THEN 'failed'
                                                    ELSE 'pending' END
                                        WHERE id=%s""", (str(e), j["id"]))
         except Exception as e:
-            print(f"[worker] {e}")
+            print(f"[worker] {e}", flush=True)
         time.sleep(3)
 
 def apply_deposit(event):
-    d = event["data"]
-    if d.get("side") != "to_service":
+    print(f"[deposit] event={json.dumps(event)}", flush=True)
+    d = event.get("data", {})
+    side = d.get("side")
+    print(f"[deposit] side={side} user_id={d.get('user_id')} sum={d.get('sum')} tx={d.get('transaction_id')}", flush=True)
+
+    if side not in ("to_service", "from_user"):
+        print(f"[deposit] SKIP side={side}", flush=True)
         return
-    tx_id = d["transaction_id"]
-    user_id = int(d["user_id"])
-    amount = Decimal(d["sum"]).quantize(Decimal("0.000000001"))
+
+    tx_id = d.get("transaction_id")
+    if not tx_id:
+        print("[deposit] SKIP no transaction_id", flush=True)
+        return
+    try:
+        user_id = int(d["user_id"])
+        amount = Decimal(str(d["sum"])).quantize(Decimal("0.000000001"))
+    except Exception as e:
+        print(f"[deposit] SKIP parse error: {e}", flush=True)
+        return
+
     if amount <= 0:
+        print(f"[deposit] SKIP amount={amount}", flush=True)
         return
+
     with conn() as c, c.cursor() as cur:
         cur.execute("""INSERT INTO transfers
                        (tg_id, direction, amount, idem_key, status, transaction_id, raw)
@@ -345,11 +364,13 @@ def apply_deposit(event):
                        RETURNING id""",
                     (user_id, amount, f"wh-{tx_id}", tx_id, json.dumps(event)))
         if not cur.fetchone():
+            print(f"[deposit] SKIP duplicate tx={tx_id}", flush=True)
             return
         cur.execute("""INSERT INTO users (tg_id, balance) VALUES (%s,%s)
                        ON CONFLICT (tg_id) DO UPDATE
                        SET balance = users.balance + EXCLUDED.balance""",
                     (user_id, amount))
+        print(f"[deposit] OK user={user_id} amount={amount}", flush=True)
 
 # ─────────── ROUTES ───────────
 @app.route("/")
@@ -479,7 +500,7 @@ def start_worker_once():
     _worker_started = True
     init_db()
     threading.Thread(target=process_jobs, daemon=True).start()
-    print("[worker] started")
+    print("[worker] started", flush=True)
 
 start_worker_once()
 
