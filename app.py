@@ -49,8 +49,6 @@ def init_db():
             status TEXT DEFAULT 'pending', raw JSONB,
             created_at TIMESTAMPTZ DEFAULT now()
         );
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_tx_id
-          ON transfers(transaction_id) WHERE transaction_id IS NOT NULL;
         CREATE TABLE IF NOT EXISTS webhook_inbox (
             id BIGSERIAL PRIMARY KEY,
             event_id UUID UNIQUE NOT NULL,
@@ -357,15 +355,14 @@ def apply_deposit(event):
         return
 
     with conn() as c, c.cursor() as cur:
-        cur.execute("""INSERT INTO transfers
-                       (tg_id, direction, amount, idem_key, status, transaction_id, raw)
-                       VALUES (%s,'in',%s,%s,'ok',%s,%s)
-                       ON CONFLICT (transaction_id) DO NOTHING
-                       RETURNING id""",
-                    (user_id, amount, f"wh-{tx_id}", tx_id, json.dumps(event)))
-        if not cur.fetchone():
+        cur.execute("SELECT id FROM transfers WHERE transaction_id=%s LIMIT 1", (tx_id,))
+        if cur.fetchone():
             print(f"[deposit] SKIP duplicate tx={tx_id}", flush=True)
             return
+        cur.execute("""INSERT INTO transfers
+                       (tg_id, direction, amount, idem_key, status, transaction_id, raw)
+                       VALUES (%s,'in',%s,%s,'ok',%s,%s)""",
+                    (user_id, amount, f"wh-{tx_id}", tx_id, json.dumps(event)))
         cur.execute("""INSERT INTO users (tg_id, balance) VALUES (%s,%s)
                        ON CONFLICT (tg_id) DO UPDATE
                        SET balance = users.balance + EXCLUDED.balance""",
