@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: bytecoin-casino
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn -w 1 -k gthread --threads 8 -b 0.0.0.0:$PORT app:app
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: DATABASE_URL
+        fromDatabase:
+          name: bytecoin-db
+          property: connectionString
+      - key: BYTECOIN_API_KEY
+        sync: false
+      - key: BYTECOIN_WEBHOOK_SECRET
+        sync: false
+      - key: BYTECOIN_ENABLED
+        value: "false"
+      - key: ADMIN_TOKEN
+        generateValue: true
+      - key: SELF_URL
+        value: https://bytecoin-casino.onrender.com
+
+databases:
+  - name: bytecoin-db
+    plan: free
+    databaseName: casino
+    user: casino
