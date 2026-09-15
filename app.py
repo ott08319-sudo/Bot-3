@@ -70,6 +70,19 @@ def init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_jobs_pending
           ON webhook_jobs(id) WHERE status='pending';
+        CREATE TABLE IF NOT EXISTS mines_games (
+            id BIGSERIAL PRIMARY KEY,
+            tg_id BIGINT NOT NULL,
+            bet NUMERIC(20,9) NOT NULL,
+            mines_count INT NOT NULL,
+            mine_cells JSONB NOT NULL,
+            opened_cells JSONB DEFAULT '[]',
+            status TEXT DEFAULT 'active',
+            payout NUMERIC(20,9) DEFAULT 0,
+            created_at TIMESTAMPTZ DEFAULT now()
+        );
+        CREATE INDEX IF NOT EXISTS idx_mines_active
+          ON mines_games(tg_id) WHERE status='active';
         """)
 
 def get_or_create_user(tg_id, username=""):
@@ -228,36 +241,131 @@ def g_roulette(bet, btype, value=None):
     payout = (bet * mult * (1 - HOUSE_EDGE)).quantize(Decimal("0.000000001")) if win else Decimal(0)
     return {"win": win, "number": n, "payout": payout}
 
-SYM = ["🍒","🍋","🔔","💎","7️⃣","⭐"]
-PAY = {"🍒":2, "🍋":3, "🔔":5, "💎":10, "7️⃣":20, "⭐":50}
-
-def g_slots(bet):
-    r = [random.choice(SYM) for _ in range(3)]
-    if r[0] == r[1] == r[2]:
-        mult = Decimal(PAY[r[0]])
-        return {"win": True, "reels": r, "multiplier": float(mult),
-                "payout": (bet * mult * (1 - HOUSE_EDGE)).quantize(Decimal("0.000000001"))}
-    if len(set(r)) == 2:
-        return {"win": True, "reels": r, "multiplier": 1.5,
-                "payout": (bet * Decimal("1.5")).quantize(Decimal("0.000000001"))}
-    return {"win": False, "reels": r, "payout": Decimal(0)}
-
 def g_crash_point():
     if random.random() < 0.01:
         return Decimal("1.00")
     return (Decimal(100) / (Decimal(100) - Decimal(random.randint(1, 99)))).quantize(Decimal("0.01"))
 
-def g_mines(bet, mines_count, picked):
-    mine_cells = set(secrets.SystemRandom().sample(range(25), mines_count))
-    if any(c in mine_cells for c in picked):
-        return {"win": False, "mine_cells": sorted(mine_cells), "payout": Decimal(0)}
-    p = len(picked)
-    if p == 0:
-        return {"win": True, "multiplier": 1.0, "payout": bet, "mine_cells": sorted(mine_cells)}
-    mult = (Decimal(comb(25, p)) / Decimal(comb(25 - mines_count, p)) * (1 - HOUSE_EDGE)).quantize(Decimal("0.0001"))
-    return {"win": True, "multiplier": float(mult),
-            "payout": (bet * mult).quantize(Decimal("0.000000001")),
-            "mine_cells": sorted(mine_cells)}
+# ─────────── MINES ───────────
+def mines_multiplier(picked, mines):
+    if picked == 0:
+        return Decimal("1.0")
+    total = Decimal(comb(25, picked))
+    safe = Decimal(comb(25 - mines, picked))
+    if safe == 0:
+        return Decimal("0")
+    return (total / safe * (1 - HOUSE_EDGE)).quantize(Decimal("0.0001"))
+
+def mines_start(u, amount, mines_count):
+    if mines_count < 1 or mines_count > 24:
+        adjust_balance(u["id"], amount)
+        return {"error": "bad_mines_count"}, 400
+    with conn() as c, c.cursor() as cur:
+        cur.execute("""UPDATE mines_games SET status='cancelled'
+                       WHERE tg_id=%s AND status='active'""", (u["id"],))
+    mine_cells = secrets.SystemRandom().sample(range(25), mines_count)
+    with conn() as c, c.cursor() as cur:
+        cur.execute("""INSERT INTO mines_games
+                       (tg_id, bet, mines_count, mine_cells, opened_cells)
+                       VALUES (%s,%s,%s,%s,'[]') RETURNING id""",
+                    (u["id"], amount, mines_count, json.dumps(mine_cells)))
+        game_id = cur.fetchone()["id"]
+    return {
+        "game_id": game_id,
+        "balance": str(get_balance(u["id"])),
+        "multiplier": "1.0",
+        "payout": "0",
+    }
+
+# ─────────── SUGAR RUSH ───────────
+SUGAR_SYMBOLS = ["🍭","🍬","🍫","🍩","🧁","🍪","⭐"]
+SUGAR_WEIGHTS = {"🍭":35,"🍬":30,"🍫":20,"🍩":10,"🧁":4,"🍪":0.9,"⭐":0.1}
+SUGAR_PAYS = {"🍭":0.1,"🍬":0.2,"🍫":0.4,"🍩":1.0,"🧁":2.5,"🍪":10.0,"⭐":0}
+
+def _sugar_random_sym():
+    total = sum(SUGAR_WEIGHTS.values())
+    r = random.random() * total
+    upto = 0
+    for sym, w in SUGAR_WEIGHTS.items():
+        upto += w
+        if r <= upto:
+            return sym
+    return "🍭"
+
+def _find_clusters(grid):
+    visited = [[False]*7 for _ in range(7)]
+    clusters = []
+    for r in range(7):
+        for c in range(7):
+            if visited[r][c] or grid[r][c] is None:
+                continue
+            sym = grid[r][c]
+            stack = [(r,c)]
+            cells = []
+            visited[r][c] = True
+            while stack:
+                cr, cc = stack.pop()
+                cells.append((cr, cc))
+                for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)]:
+                    nr, nc = cr+dr, cc+dc
+                    if 0 <= nr < 7 and 0 <= nc < 7 and not visited[nr][nc] and grid[nr][nc] == sym:
+                        visited[nr][nc] = True
+                        stack.append((nr, nc))
+            if len(cells) >= 5:
+                clusters.append({"symbol": sym, "cells": cells, "size": len(cells)})
+    return clusters
+
+def g_sugar_rush(bet):
+    grid = [[_sugar_random_sym() for _ in range(7)] for _ in range(7)]
+    multipliers = [[1 for _ in range(7)] for _ in range(7)]
+    total_payout = Decimal(0)
+    cascades = 0
+    all_wins = []
+    max_cascades = 50
+
+    while cascades < max_cascades:
+        clusters = _find_clusters(grid)
+        if not clusters:
+            break
+        cascade_win = Decimal(0)
+        to_clear = set()
+        for cl in clusters:
+            base = Decimal(str(SUGAR_PAYS.get(cl["symbol"], 0))) * Decimal(cl["size"]) / Decimal(10)
+            cluster_mult = Decimal(0)
+            for (r, c) in cl["cells"]:
+                cluster_mult += Decimal(multipliers[r][c])
+            cluster_mult = max(cluster_mult, Decimal(1))
+            win = (base * cluster_mult * (1 - HOUSE_EDGE)).quantize(Decimal("0.000000001"))
+            cascade_win += win
+            all_wins.append({"symbol": cl["symbol"], "size": cl["size"], "win": str(win)})
+            for (r, c) in cl["cells"]:
+                to_clear.add((r, c))
+        total_payout += cascade_win
+        for (r, c) in to_clear:
+            multipliers[r][c] = min(multipliers[r][c] * 2, 128)
+        for (r, c) in to_clear:
+            grid[r][c] = None
+        for c in range(7):
+            column = [grid[r][c] for r in range(7) if grid[r][c] is not None]
+            for r in range(7 - len(column)):
+                column.insert(0, _sugar_random_sym())
+            for r in range(7):
+                grid[r][c] = column[r]
+        cascades += 1
+
+    payout = (bet * total_payout).quantize(Decimal("0.000000001"))
+    max_win = (bet * Decimal(5000)).quantize(Decimal("0.000000001"))
+    if payout > max_win:
+        payout = max_win
+
+    return {
+        "win": payout > 0,
+        "payout": payout,
+        "cascades": cascades,
+        "grid": grid,
+        "multipliers": multipliers,
+        "wins": all_wins[:20],
+    }
 
 # ─────────── WEBHOOK ───────────
 def verify_webhook(headers, raw):
@@ -299,7 +407,7 @@ def webhook():
     except Exception as e:
         print(f"[webhook] verify failed: {e}", flush=True)
         return jsonify({"code": "INVALID_WEBHOOK_SIGNATURE"}), 401
-    print(f"[webhook] received event_type={event.get('event')} id={event.get('id')}", flush=True)
+    print(f"[webhook] received event_type={event.get('event')}", flush=True)
     try:
         save_event_and_job(event)
     except Exception as e:
@@ -334,11 +442,9 @@ def process_jobs():
         time.sleep(3)
 
 def apply_deposit(event):
-    print(f"[deposit] event={json.dumps(event)}", flush=True)
     d = event.get("data", {})
     side = d.get("side")
     if side not in ("to_service", "from_user"):
-        print(f"[deposit] SKIP side={side}", flush=True)
         return
     tx_id = d.get("transaction_id")
     if not tx_id:
@@ -346,15 +452,13 @@ def apply_deposit(event):
     try:
         user_id = int(d["user_id"])
         amount = Decimal(str(d["sum"])).quantize(Decimal("0.000000001"))
-    except Exception as e:
-        print(f"[deposit] parse error: {e}", flush=True)
+    except Exception:
         return
     if amount <= 0:
         return
     with conn() as c, c.cursor() as cur:
         cur.execute("SELECT id FROM transfers WHERE transaction_id=%s LIMIT 1", (tx_id,))
         if cur.fetchone():
-            print(f"[deposit] SKIP duplicate tx={tx_id}", flush=True)
             return
         cur.execute("""INSERT INTO transfers
                        (tg_id, direction, amount, idem_key, status, transaction_id, raw)
@@ -399,20 +503,31 @@ def bet():
     if amount <= 0:
         return {"error": "bad_amount"}, 400
 
+    # Атомарно списываем
     with conn() as c, c.cursor() as cur:
         cur.execute("""UPDATE users SET balance = balance - %s
                        WHERE tg_id = %s AND balance >= %s
                        RETURNING balance""", (amount, u["id"], amount))
-        row = cur.fetchone()
-        if not row:
+        if not cur.fetchone():
             return {"error": "insufficient_funds"}, 400
+
+    # Мины — отдельная сессия
+    if game == "mines":
+        adjust_balance(u["id"], amount)  # откат, mines_start сам спишет
+        # Списываем заново внутри mines_start
+        with conn() as c, c.cursor() as cur:
+            cur.execute("""UPDATE users SET balance = balance - %s
+                           WHERE tg_id = %s AND balance >= %s
+                           RETURNING balance""", (amount, u["id"], amount))
+            if not cur.fetchone():
+                return {"error": "insufficient_funds"}, 400
+        return mines_start(u, amount, int(d["mines"]))
 
     if   game == "dice":     res = g_dice(amount, int(d["target"]), bool(d["over"]))
     elif game == "coinflip": res = g_coin(amount, d["side"])
     elif game == "roulette": res = g_roulette(amount, d["bet_type"], d.get("value"))
-    elif game == "slots":    res = g_slots(amount)
+    elif game == "slots":    res = g_sugar_rush(amount)
     elif game == "crash":    res = {"win": True, "point": str(g_crash_point()), "payout": amount}
-    elif game == "mines":    res = g_mines(amount, int(d["mines"]), d["picked"])
     else:
         adjust_balance(u["id"], amount)
         return {"error": "unknown_game"}, 400
@@ -420,10 +535,126 @@ def bet():
     payout = res.get("payout", Decimal(0))
     if payout > 0:
         adjust_balance(u["id"], payout)
-    record_bet(u["id"], game, amount, payout, {k: str(v) for k, v in res.items()})
+    record_bet(u["id"], game, amount, payout,
+               {k: str(v)[:500] for k, v in res.items()})
+
+    # grid и multipliers — списки, конвертируем для JSON
+    result_clean = {}
+    for k, v in res.items():
+        if isinstance(v, Decimal):
+            result_clean[k] = str(v)
+        else:
+            result_clean[k] = v
 
     return {
-        "result": {k: str(v) for k, v in res.items()},
+        "result": result_clean,
+        "balance": str(get_balance(u["id"])),
+    }
+
+@app.route("/api/mines/open", methods=["POST"])
+@require_auth
+def mines_open():
+    u = request.tg_user
+    d = request.json or {}
+    game_id = int(d.get("game_id", 0))
+    cell = int(d.get("cell", -1))
+    if cell < 0 or cell > 24:
+        return {"error": "bad_cell"}, 400
+
+    with conn() as c, c.cursor() as cur:
+        cur.execute("""SELECT * FROM mines_games
+                       WHERE id=%s AND tg_id=%s AND status='active'
+                       FOR UPDATE""", (game_id, u["id"]))
+        g = cur.fetchone()
+        if not g:
+            return {"error": "no_active_game"}, 400
+
+        mine_cells = g["mine_cells"]
+        opened = g["opened_cells"] or []
+        if isinstance(opened, str): opened = json.loads(opened)
+        if isinstance(mine_cells, str): mine_cells = json.loads(mine_cells)
+
+        if cell in opened:
+            return {"error": "already_opened"}, 400
+
+        if cell in mine_cells:
+            cur.execute("""UPDATE mines_games
+                           SET status='lost', payout=0, opened_cells=%s
+                           WHERE id=%s""",
+                        (json.dumps(opened + [cell]), game_id))
+            return {
+                "result": "mine",
+                "mine_cells": mine_cells,
+                "opened": opened + [cell],
+                "balance": str(get_balance(u["id"])),
+            }
+
+        opened.append(cell)
+        picked = len(opened)
+        mult = mines_multiplier(picked, g["mines_count"])
+        payout = (g["bet"] * mult).quantize(Decimal("0.000000001"))
+        safe_total = 25 - g["mines_count"]
+
+        if picked >= safe_total:
+            cur.execute("""UPDATE mines_games
+                           SET status='won', payout=%s, opened_cells=%s
+                           WHERE id=%s""",
+                        (payout, json.dumps(opened), game_id))
+            adjust_balance(u["id"], payout)
+            record_bet(u["id"], "mines", g["bet"], payout,
+                       {"picked": picked, "mult": str(mult)})
+            return {
+                "result": "win_all",
+                "opened": opened,
+                "multiplier": str(mult),
+                "payout": str(payout),
+                "balance": str(get_balance(u["id"])),
+            }
+
+        cur.execute("""UPDATE mines_games SET opened_cells=%s WHERE id=%s""",
+                    (json.dumps(opened), game_id))
+        return {
+            "result": "safe",
+            "opened": opened,
+            "multiplier": str(mult),
+            "payout": str(payout),
+            "balance": str(get_balance(u["id"])),
+        }
+
+@app.route("/api/mines/cashout", methods=["POST"])
+@require_auth
+def mines_cashout():
+    u = request.tg_user
+    d = request.json or {}
+    game_id = int(d.get("game_id", 0))
+
+    with conn() as c, c.cursor() as cur:
+        cur.execute("""SELECT * FROM mines_games
+                       WHERE id=%s AND tg_id=%s AND status='active'
+                       FOR UPDATE""", (game_id, u["id"]))
+        g = cur.fetchone()
+        if not g:
+            return {"error": "no_active_game"}, 400
+
+        opened = g["opened_cells"] or []
+        if isinstance(opened, str): opened = json.loads(opened)
+        if not opened:
+            return {"error": "nothing_opened"}, 400
+
+        mult = mines_multiplier(len(opened), g["mines_count"])
+        payout = (g["bet"] * mult).quantize(Decimal("0.000000001"))
+
+        cur.execute("""UPDATE mines_games
+                       SET status='won', payout=%s WHERE id=%s""",
+                    (payout, game_id))
+        adjust_balance(u["id"], payout)
+        record_bet(u["id"], "mines", g["bet"], payout,
+                   {"picked": len(opened), "mult": str(mult), "cashout": True})
+
+    return {
+        "result": "cashout",
+        "payout": str(payout),
+        "multiplier": str(mult),
         "balance": str(get_balance(u["id"])),
     }
 
@@ -448,7 +679,6 @@ def withdraw():
         return {"error": "receiver_not_registered"}, 400
 
     idem = f"wd-{u['id']}-{uuid.uuid4()}"
-
     with conn() as c, c.cursor() as cur:
         cur.execute("""INSERT INTO transfers (tg_id, direction, amount, idem_key, status)
                        VALUES (%s,'out',%s,%s,'pending') RETURNING id""",
@@ -469,34 +699,6 @@ def withdraw():
         adjust_balance(u["id"], amount)
         return {"error": resp.get("code", "FAILED"), "message": resp.get("error", "")}, 400
 
-@app.route("/admin/stats")
-def admin_stats():
-    if request.headers.get("X-Admin-Token") != ADMIN_TOKEN or not ADMIN_TOKEN:
-        return {"error": "forbidden"}, 403
-    stat = bc_stat()
-    if stat.get("status") != "ok":
-        return {"error": "api_down", "detail": stat}, 502
-    d = stat["data"]
-    with conn() as c, c.cursor() as cur:
-        cur.execute("SELECT COALESCE(SUM(balance),0) AS t FROM users")
-        users_total = cur.fetchone()["t"]
-    sb = Decimal(d["balance"]); hold = Decimal(d["in_hold"])
-    liability = users_total + hold
-    cov = float(sb / liability) if liability > 0 else None
-    return {
-        "service_balance": str(sb), "users_total": str(users_total),
-        "in_hold": str(hold), "coverage_ratio": cov,
-        "warning": "LOW_COVERAGE" if cov and cov < 1.1 else None,
-        "today": {"in": d["transactions_in"], "out": d["transactions_out"],
-                  "coins_in": d["coins_in"], "coins_out": d["coins_out"]},
-    }
-
-@app.route("/admin/freeze", methods=["POST"])
-def admin_freeze():
-    if request.headers.get("X-Admin-Token") != ADMIN_TOKEN or not ADMIN_TOKEN:
-        return {"error": "forbidden"}, 403
-    return bc_maintenance(bool(request.json.get("on")))
-
 # ─────────── TELEGRAM BOT ───────────
 tg_bot = TgBot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -510,18 +712,14 @@ async def cmd_start(message: Message):
         "🎰 *Byte Casino*\n\n"
         "💎 Крути рулетку\n"
         "🎲 Бросай кости\n"
-        "🍒 Срывай джекпот\n\n"
+        "🍭 Срывай джекпот в Sugar Rush\n\n"
         "Пополняй через Bytecoin и играй!"
     )
     gif_url = f"{SELF_URL}/static/casino.gif" if SELF_URL else None
     try:
         if gif_url:
-            await message.answer_animation(
-                animation=gif_url,
-                caption=caption,
-                parse_mode="Markdown",
-                reply_markup=kb
-            )
+            await message.answer_animation(animation=gif_url, caption=caption,
+                                           parse_mode="Markdown", reply_markup=kb)
             return
     except Exception as e:
         print(f"[bot] gif failed: {e}", flush=True)
