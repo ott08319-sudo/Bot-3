@@ -1,4 +1,4 @@
-import os, json, hmac, hashlib, time, uuid, threading, re, random, secrets
+import os, json, hmac, hashlib, time, uuid, threading, re, random, secrets, asyncio
 from decimal import Decimal
 from functools import wraps
 from math import comb
@@ -7,6 +7,10 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 import requests
 from flask import Flask, request, jsonify, render_template
+
+from aiogram import Bot as TgBot, Dispatcher
+from aiogram.filters import Command
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
 
 app = Flask(__name__, template_folder=".", static_folder=".")
 
@@ -333,27 +337,20 @@ def apply_deposit(event):
     print(f"[deposit] event={json.dumps(event)}", flush=True)
     d = event.get("data", {})
     side = d.get("side")
-    print(f"[deposit] side={side} user_id={d.get('user_id')} sum={d.get('sum')} tx={d.get('transaction_id')}", flush=True)
-
     if side not in ("to_service", "from_user"):
         print(f"[deposit] SKIP side={side}", flush=True)
         return
-
     tx_id = d.get("transaction_id")
     if not tx_id:
-        print("[deposit] SKIP no transaction_id", flush=True)
         return
     try:
         user_id = int(d["user_id"])
         amount = Decimal(str(d["sum"])).quantize(Decimal("0.000000001"))
     except Exception as e:
-        print(f"[deposit] SKIP parse error: {e}", flush=True)
+        print(f"[deposit] parse error: {e}", flush=True)
         return
-
     if amount <= 0:
-        print(f"[deposit] SKIP amount={amount}", flush=True)
         return
-
     with conn() as c, c.cursor() as cur:
         cur.execute("SELECT id FROM transfers WHERE transaction_id=%s LIMIT 1", (tx_id,))
         if cur.fetchone():
@@ -398,10 +395,17 @@ def bet():
     d = request.json or {}
     game = d.get("game")
     amount = Decimal(str(d.get("amount", "0"))).quantize(Decimal("0.000000001"))
-    if amount <= 0 or get_balance(u["id"]) < amount:
-        return {"error": "insufficient_funds"}, 400
 
-    adjust_balance(u["id"], -amount)
+    if amount <= 0:
+        return {"error": "bad_amount"}, 400
+
+    with conn() as c, c.cursor() as cur:
+        cur.execute("""UPDATE users SET balance = balance - %s
+                       WHERE tg_id = %s AND balance >= %s
+                       RETURNING balance""", (amount, u["id"], amount))
+        row = cur.fetchone()
+        if not row:
+            return {"error": "insufficient_funds"}, 400
 
     if   game == "dice":     res = g_dice(amount, int(d["target"]), bool(d["over"]))
     elif game == "coinflip": res = g_coin(amount, d["side"])
@@ -431,10 +435,16 @@ def withdraw():
 
     if amount < MIN_TRANSFER:
         return {"error": "min_withdraw", "min": str(MIN_TRANSFER)}, 400
-    if get_balance(u["id"]) < amount:
-        return {"error": "insufficient_funds"}, 400
+
+    with conn() as c, c.cursor() as cur:
+        cur.execute("""UPDATE users SET balance = balance - %s
+                       WHERE tg_id = %s AND balance >= %s
+                       RETURNING balance""", (amount, u["id"], amount))
+        if not cur.fetchone():
+            return {"error": "insufficient_funds"}, 400
 
     if BC_ENABLED and not bc_users_info([u["id"]]).get(str(u["id"])):
+        adjust_balance(u["id"], amount)
         return {"error": "receiver_not_registered"}, 400
 
     idem = f"wd-{u['id']}-{uuid.uuid4()}"
@@ -445,7 +455,6 @@ def withdraw():
                     (u["id"], amount, idem))
         row_id = cur.fetchone()["id"]
 
-    adjust_balance(u["id"], -amount)
     resp = bc_transfer(u["id"], amount, idem)
 
     with conn() as c, c.cursor() as cur:
@@ -488,6 +497,45 @@ def admin_freeze():
         return {"error": "forbidden"}, 403
     return bc_maintenance(bool(request.json.get("on")))
 
+# ─────────── TELEGRAM BOT ───────────
+tg_bot = TgBot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+@dp.message(Command("start"))
+async def cmd_start(message: Message):
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🎮 Играть", web_app=WebAppInfo(url=SELF_URL))
+    ]])
+    caption = (
+        "🎰 *Byte Casino*\n\n"
+        "💎 Крути рулетку\n"
+        "🎲 Бросай кости\n"
+        "🍒 Срывай джекпот\n\n"
+        "Пополняй через Bytecoin и играй!"
+    )
+    gif_url = f"{SELF_URL}/static/casino.gif" if SELF_URL else None
+    try:
+        if gif_url:
+            await message.answer_animation(
+                animation=gif_url,
+                caption=caption,
+                parse_mode="Markdown",
+                reply_markup=kb
+            )
+            return
+    except Exception as e:
+        print(f"[bot] gif failed: {e}", flush=True)
+    await message.answer(caption, parse_mode="Markdown", reply_markup=kb)
+
+async def run_telegram_bot():
+    print("[bot] polling started", flush=True)
+    await dp.start_polling(tg_bot)
+
+def start_bot_thread():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(run_telegram_bot())
+
 # ─────────── BOOT ───────────
 _worker_started = False
 def start_worker_once():
@@ -497,6 +545,7 @@ def start_worker_once():
     _worker_started = True
     init_db()
     threading.Thread(target=process_jobs, daemon=True).start()
+    threading.Thread(target=start_bot_thread, daemon=True).start()
     print("[worker] started", flush=True)
 
 start_worker_once()
